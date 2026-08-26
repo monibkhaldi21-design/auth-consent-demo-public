@@ -8,12 +8,14 @@ const cors = require('cors');
 const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
+const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 const DATABASE_URL = process.env.DATABASE_URL || process.env.DB_URL || 'postgres://postgres:postgres@db:5432/authdemo';
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-me';
 const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || 'change-me-jwt-secret';
+const EXPORT_JWT_SECRET = process.env.EXPORT_JWT_SECRET || 'replace-this-export-secret';
 const PORT = process.env.PORT || 3000;
 const ENABLE_CORS = process.env.ENABLE_CORS === 'true';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -58,6 +60,17 @@ async function initDb() {
       mime_type TEXT,
       size_bytes BIGINT,
       uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+    );
+  `);
+
+  // audit table for exports
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS exports_audit (
+      id SERIAL PRIMARY KEY,
+      user_email TEXT,
+      request_ip TEXT,
+      token TEXT,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
     );
   `);
 
@@ -108,6 +121,20 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
+// nodemailer transporter (optional - configured via env)
+let mailer = null;
+if (process.env.SMTP_HOST && process.env.SMTP_USER) {
+  mailer = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: parseInt(process.env.SMTP_PORT || '587', 10),
+    secure: process.env.SMTP_SECURE === 'true',
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    }
+  });
+}
+
 app.post('/receive', async (req, res) => {
   const { email, password, consent, consent_at, consent_text, hashed } = req.body || {};
   if (!consent) return res.status(400).send('مطلوب موافقة صريحة (consent).');
@@ -156,6 +183,74 @@ app.post('/upload', upload.array('files'), async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'server error' });
+  }
+});
+
+// request export: creates a short-lived token and emails or returns a link for testing
+app.post('/request-export', async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).send('email required');
+
+    // ensure user exists
+    const r = await pool.query('SELECT id,email FROM users WHERE email=$1', [email]);
+    if (r.rowCount === 0) return res.status(404).send('user not found');
+
+    const token = jwt.sign({ email, action: 'export' }, EXPORT_JWT_SECRET, { expiresIn: '15m' });
+    const link = `${req.protocol}://${req.get('host')}/export-data?token=${encodeURIComponent(token)}`;
+
+    // audit the request
+    const requestIp = getClientIp(req);
+    await pool.query('INSERT INTO exports_audit (user_email, request_ip, token) VALUES ($1,$2,$3)', [email, requestIp, token]);
+
+    if (mailer) {
+      // send mail with link
+      await mailer.sendMail({
+        from: process.env.SMTP_FROM || 'no-reply@example.com',
+        to: email,
+        subject: 'Export your data',
+        text: `You requested an export. Download: ${link}`
+      });
+      return res.json({ ok: true, message: 'Export link sent to email (if configured).' });
+    }
+
+    // mailer not configured: return link in response for testing only
+    return res.json({ ok: true, link });
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('server error');
+  }
+});
+
+// export-data: validate token and return JSON export (attachment)
+app.get('/export-data', async (req, res) => {
+  try {
+    const { token } = req.query || {};
+    if (!token) return res.status(400).send('token required');
+
+    let payload;
+    try {
+      payload = jwt.verify(token, EXPORT_JWT_SECRET);
+    } catch (err) {
+      return res.status(400).send('invalid or expired token');
+    }
+
+    if (payload.action !== 'export') return res.status(403).send('invalid action');
+    const email = payload.email;
+
+    const userRow = await pool.query('SELECT id,email,consent_at,received_at FROM users WHERE email=$1', [email]);
+    if (userRow.rowCount === 0) return res.status(404).send('user not found');
+
+    const files = await pool.query('SELECT original_name,stored_name,size_bytes,uploaded_at FROM files WHERE user_email=$1', [email]);
+    const exportObj = { user: userRow.rows[0], files: files.rows };
+
+    const filename = `export-${email.replace(/[^a-z0-9@.\-]/gi,'')}-${Date.now()}.json`;
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', 'application/json');
+    res.send(JSON.stringify(exportObj, null, 2));
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('server error');
   }
 });
 
