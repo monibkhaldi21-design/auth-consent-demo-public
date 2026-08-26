@@ -1,0 +1,25 @@
+{
+  "cli": {
+    "version": ">= 5.4.0"
+  },
+  "build": {
+    "production": {
+      "node": "18.13.0",
+      "npm": "9.8.1",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://yourapiurl.com"
+      }
+    },
+    "preview": {
+      "node": "18.13.0",
+      "npm": "9.8.1"
+    },
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}
