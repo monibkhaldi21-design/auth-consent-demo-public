@@ -123,16 +123,20 @@ const upload = multer({ storage });
 
 // nodemailer transporter (optional - configured via env)
 let mailer = null;
-if (process.env.SMTP_HOST && process.env.SMTP_USER) {
-  mailer = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: parseInt(process.env.SMTP_PORT || '587', 10),
-    secure: process.env.SMTP_SECURE === 'true',
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS
-    }
-  });
+if (process.env.SMTP_HOST && (process.env.SMTP_USER || process.env.SMTP_PASS || process.env.SMTP_PORT)) {
+  try {
+    mailer = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: parseInt(process.env.SMTP_PORT || '587', 10),
+      secure: process.env.SMTP_SECURE === 'true',
+      auth: (process.env.SMTP_USER && process.env.SMTP_PASS) ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined
+    });
+    // verify transporter (non-blocking)
+    mailer.verify().then(() => console.log('Mailer configured')).catch(err => console.warn('Mailer verify failed:', err.message));
+  } catch (e) {
+    console.warn('Failed to configure mailer:', e.message);
+    mailer = null;
+  }
 }
 
 app.post('/receive', async (req, res) => {
@@ -186,7 +190,7 @@ app.post('/upload', upload.array('files'), async (req, res) => {
   }
 });
 
-// request export: creates a short-lived token and emails or returns a link for testing
+// request export: requires SMTP to be configured. will send email with link; will NOT return link in JSON
 app.post('/request-export', async (req, res) => {
   try {
     const { email } = req.body || {};
@@ -196,6 +200,11 @@ app.post('/request-export', async (req, res) => {
     const r = await pool.query('SELECT id,email FROM users WHERE email=$1', [email]);
     if (r.rowCount === 0) return res.status(404).send('user not found');
 
+    if (!mailer) {
+      console.warn('Export requested but SMTP not configured');
+      return res.status(500).json({ ok: false, error: 'SMTP not configured on server. Configure SMTP to enable email delivery.' });
+    }
+
     const token = jwt.sign({ email, action: 'export' }, EXPORT_JWT_SECRET, { expiresIn: '15m' });
     const link = `${req.protocol}://${req.get('host')}/export-data?token=${encodeURIComponent(token)}`;
 
@@ -203,19 +212,15 @@ app.post('/request-export', async (req, res) => {
     const requestIp = getClientIp(req);
     await pool.query('INSERT INTO exports_audit (user_email, request_ip, token) VALUES ($1,$2,$3)', [email, requestIp, token]);
 
-    if (mailer) {
-      // send mail with link
-      await mailer.sendMail({
-        from: process.env.SMTP_FROM || 'no-reply@example.com',
-        to: email,
-        subject: 'Export your data',
-        text: `You requested an export. Download: ${link}`
-      });
-      return res.json({ ok: true, message: 'Export link sent to email (if configured).' });
-    }
+    // send mail with link
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM || 'no-reply@example.com',
+      to: email,
+      subject: 'Export your data',
+      text: `You requested an export. Download: ${link}`
+    });
 
-    // mailer not configured: return link in response for testing only
-    return res.json({ ok: true, link });
+    return res.json({ ok: true, message: 'Export link sent to email.' });
   } catch (e) {
     console.error(e);
     res.status(500).send('server error');
