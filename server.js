@@ -1,3 +1,10 @@
+// auth-consent-demo server (updated)
+// Changes made:
+// - Fixed INSERT ... ON CONFLICT SQL (was truncated)
+// - Serve static files (so index.html is available at /)
+// - Added upload limits and file type filtering
+// - Read max upload size from env (MAX_UPLOAD_MB)
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const bcrypt = require('bcrypt');
@@ -21,6 +28,9 @@ const ENABLE_CORS = process.env.ENABLE_CORS === 'true';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const RETENTION_DAYS = parseInt(process.env.RETENTION_DAYS || '365', 10);
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
+const MAX_UPLOAD_MB = parseInt(process.env.MAX_UPLOAD_MB || '20', 10); // default 20 MB
+const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
+const ALLOWED_MIME = (process.env.ALLOWED_MIME || 'image/jpeg,image/png,application/pdf,text/plain').split(',').map(s => s.trim());
 
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -88,11 +98,15 @@ async function initDb() {
 
 const app = express();
 app.use(helmet());
-app.use(bodyParser.json());
+// Limit JSON body size to avoid huge payloads
+app.use(bodyParser.json({ limit: '1mb' }));
 if (ENABLE_CORS) {
   const corsOptions = ALLOWED_ORIGINS.length ? { origin: ALLOWED_ORIGINS } : {};
   app.use(cors(corsOptions));
 }
+
+// Serve static files (index.html) from project root
+app.use(express.static(path.join(__dirname)));
 
 function getClientIp(req) {
   return (req.headers['x-forwarded-for'] || '').split(',').shift().trim() || req.socket.remoteAddress || null;
@@ -111,7 +125,7 @@ function requireAdminJWT(req, res, next) {
   }
 }
 
-// multer storage
+// multer storage + limits + fileFilter
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
@@ -119,7 +133,13 @@ const storage = multer.diskStorage({
     cb(null, safe);
   }
 });
-const upload = multer({ storage });
+
+function fileFilter(req, file, cb) {
+  if (ALLOWED_MIME.includes(file.mimetype)) return cb(null, true);
+  cb(new Error('File type not allowed: ' + file.mimetype));
+}
+
+const upload = multer({ storage, limits: { fileSize: MAX_UPLOAD_BYTES }, fileFilter });
 
 // nodemailer transporter (optional - configured via env)
 let mailer = null;
@@ -152,8 +172,19 @@ app.post('/receive', async (req, res) => {
     const clientIp = getClientIp(req);
     const userAgent = req.headers['user-agent'] || null;
 
-    const q = `INSERT INTO users (email, password_hash, client_sent_hashed, consent_given, consent_at, client_ip, user_agent, received_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (email) DO UPDATE SET password_hash=EXCLUDED.password_hash, client_sent_hashed=EXCLUDED.client_sent_hashed, consent_given=EXCLUDED.consent_given, consent_at=EXCLUDED.consent_at, client_ip=EXCLUDED.client_ip, user_agent=EXCLUDED.user_agent, received_at=EXCLUDED.received_at RETURNING id`;
+    const q = `
+      INSERT INTO users (email, password_hash, client_sent_hashed, consent_given, consent_at, client_ip, user_agent, received_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (email) DO UPDATE SET
+        password_hash = EXCLUDED.password_hash,
+        client_sent_hashed = EXCLUDED.client_sent_hashed,
+        consent_given = EXCLUDED.consent_given,
+        consent_at = EXCLUDED.consent_at,
+        client_ip = EXCLUDED.client_ip,
+        user_agent = EXCLUDED.user_agent,
+        received_at = EXCLUDED.received_at
+      RETURNING id;
+    `;
     const values = [email, passwordHash, clientSentHashed, true, consent_at, clientIp, userAgent, receivedAt];
     const r = await pool.query(q, values);
     res.send({ ok: true, id: r.rows[0].id });
@@ -171,7 +202,7 @@ app.post('/upload', upload.array('files'), async (req, res) => {
     const email = req.body.email || null;
 
     if (!consent) {
-      if (req.files) for (const f of req.files) fs.unlinkSync(f.path);
+      if (req.files) for (const f of req.files) try { fs.unlinkSync(f.path); } catch(e){}
       return res.status(400).json({ error: 'مطلوب موافقة صريحة (consent).' });
     }
 
@@ -186,6 +217,8 @@ app.post('/upload', upload.array('files'), async (req, res) => {
     res.json({ ok: true, saved: saved.length, files: saved });
   } catch (e) {
     console.error(e);
+    // Multer fileFilter or size errors are often here
+    if (e && e.message && e.message.startsWith('File type not allowed')) return res.status(400).json({ error: e.message });
     res.status(500).json({ error: 'server error' });
   }
 });
